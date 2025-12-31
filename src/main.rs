@@ -7,16 +7,14 @@ use std::{
     time::Duration,
 };
 
+use arboard::Clipboard; // クリップボード用
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 // pulldown_cmarkからhtmlモジュールをインポート
-use pulldown_cmark::{
-    html, Alignment as MarkdownAlignment, CodeBlockKind, Event as MarkdownEvent, HeadingLevel,
-    Options, Parser as MarkdownParser, Tag, TagEnd,
-};
+use pulldown_cmark::{html, Options, Parser as MarkdownParser};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -31,29 +29,16 @@ struct ColorScheme {
     selection_fg: Color,
     comment: Color,
     link: Color,
-    heading: Color,
-    code_bg: Color,
-    inline_code_bg: Color,
-    quote_fg: Color,
-    quote_border: Color,
-    hr: Color,
 }
 
 const GITHUB_DARK_THEME: ColorScheme = ColorScheme {
-    bg: Color::Rgb(13, 17, 23),         // #0d1117
-    fg: Color::Rgb(201, 209, 217),      // #c9d1d9
+    bg: Color::Rgb(13, 17, 23),          // #0d1117
+    fg: Color::Rgb(201, 209, 217),       // #c9d1d9
     selection_bg: Color::Rgb(3, 34, 82), // A selection color
     selection_fg: Color::Rgb(201, 209, 217),
-    comment: Color::Rgb(139, 148, 158), // #8b949e
-    link: Color::Rgb(88, 166, 255),     // #58a6ff
-    heading: Color::Rgb(88, 166, 255),  // Using link color for headings
-    code_bg: Color::Rgb(22, 27, 34),    // #161b22
-    inline_code_bg: Color::Rgb(40, 45, 53),
-    quote_fg: Color::Rgb(139, 148, 158), // #8b949e
-    quote_border: Color::Rgb(48, 54, 61), // #30363d
-    hr: Color::Rgb(33, 38, 45),         // #21262d
+    comment: Color::Rgb(139, 148, 158),  // #8b949e
+    link: Color::Rgb(88, 166, 255),      // #58a6ff
 };
-
 
 // --- アプリケーションの状態管理 ---
 
@@ -66,7 +51,8 @@ struct ExplorerState {
     current_path: PathBuf,
     entries: Vec<PathBuf>,
     list_state: ListState,
-    error_message: Option<String>,
+    status_message: Option<String>, // エラーまたは成功メッセージ
+    is_error: bool,                 // メッセージがエラーかどうか
     command_input: String,
     in_command_mode: bool,
 }
@@ -77,7 +63,8 @@ impl ExplorerState {
             current_path: env::current_dir()?,
             entries: Vec::new(),
             list_state: ListState::default(),
-            error_message: None,
+            status_message: None,
+            is_error: false,
             command_input: String::new(),
             in_command_mode: false,
         };
@@ -109,60 +96,171 @@ impl ExplorerState {
     }
 
     fn next(&mut self) {
-        if self.entries.is_empty() { return; }
+        if self.entries.is_empty() {
+            return;
+        }
         let i = self.list_state.selected().map_or(0, |i| {
-            if i >= self.entries.len() - 1 { 0 } else { i + 1 }
+            if i >= self.entries.len() - 1 {
+                0
+            } else {
+                i + 1
+            }
         });
         self.list_state.select(Some(i));
     }
 
     fn previous(&mut self) {
-        if self.entries.is_empty() { return; }
+        if self.entries.is_empty() {
+            return;
+        }
         let i = self.list_state.selected().map_or(0, |i| {
-            if i == 0 { self.entries.len() - 1 } else { i - 1 }
+            if i == 0 {
+                self.entries.len() - 1
+            } else {
+                i - 1
+            }
         });
         self.list_state.select(Some(i));
+    }
+
+    fn set_message(&mut self, message: String, is_error: bool) {
+        self.status_message = Some(message);
+        self.is_error = is_error;
+    }
+
+    fn clear_message(&mut self) {
+        self.status_message = None;
+        self.is_error = false;
     }
 }
 
 struct PreviewState {
     content: Text<'static>,
+    original_text: String, // コピー用に原文を保持
     scroll: u16,
     title: String,
     char_count: usize,
+    status_message: Option<String>, // "Copied!" などの一時メッセージ
+    clipboard: Option<Clipboard>,   // Clipboardインスタンスを保持して早期Dropを防ぐ
 }
 
 impl PreviewState {
-    fn new(file_path: &Path, theme: &ColorScheme) -> io::Result<Self> {
-        let original_markdown = fs::read_to_string(file_path)?;
-        let char_count = original_markdown.chars().count();
-        let placeholder = "[[BR_TAG]]";
-        let processed_markdown = original_markdown
-            .replace("<br>", placeholder)
-            .replace("<BR>", placeholder);
-        let content = render_markdown(&processed_markdown, placeholder, theme);
+    // プレーンテキスト表示用
+    fn new_text(file_path: &Path, content_str: String, theme: &ColorScheme) -> Self {
+        let char_count = content_str.chars().count();
+        let content = Text::styled(content_str.clone(), Style::default().fg(theme.fg));
 
-        Ok(Self {
+        // Clipboardの初期化をここで行い、インスタンスを保持する
+        let clipboard = Clipboard::new().ok();
+
+        Self {
             content,
+            original_text: content_str,
             scroll: 0,
             title: file_path.to_string_lossy().to_string(),
             char_count,
-        })
+            status_message: None,
+            clipboard,
+        }
+    }
+
+    // HTMLソース表示用（簡易ハイライト付き）
+    fn new_html(file_path: &Path, html_source: String, theme: &ColorScheme) -> Self {
+        let char_count = html_source.chars().count();
+        // ハイライト処理
+        let content = highlight_html(&html_source, theme);
+
+        // Clipboardの初期化をここで行い、インスタンスを保持する
+        let clipboard = Clipboard::new().ok();
+
+        Self {
+            content,
+            original_text: html_source,
+            scroll: 0,
+            title: file_path.to_string_lossy().to_string(),
+            char_count,
+            status_message: None,
+            clipboard,
+        }
     }
 
     fn scroll_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(1);
     }
 
-    // スクロールダウンのロジックを修正
     fn scroll_down(&mut self) {
-        // コンテンツの高さから1を引いた値を最大スクロール位置とする
-        // これにより、画面の高さに関わらずコンテンツの最後までスクロールできる
         let max_scroll = self.content.height().saturating_sub(1) as u16;
         if self.scroll < max_scroll {
             self.scroll = self.scroll.saturating_add(1);
         }
     }
+
+    fn copy_to_clipboard(&mut self) {
+        // 保持しているインスタンスを使用する
+        // インスタンスがない場合（初期化失敗時など）は再作成を試みる
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
+        }
+
+        if let Some(clipboard) = &mut self.clipboard {
+            if let Err(e) = clipboard.set_text(&self.original_text) {
+                self.status_message = Some(format!("Copy failed: {}", e));
+            } else {
+                // 成功時はメッセージを表示しない
+                self.status_message = None;
+            }
+        } else {
+            self.status_message = Some("Clipboard not available".to_string());
+        }
+    }
+}
+
+// 簡易HTMLハイライト関数
+fn highlight_html(html_source: &str, theme: &ColorScheme) -> Text<'static> {
+    let mut lines = Vec::new();
+
+    for line in html_source.lines() {
+        let mut spans = Vec::new();
+        let mut current_text = String::new();
+        let mut in_tag = false;
+
+        for c in line.chars() {
+            if c == '<' {
+                // タグ開始前までのテキストをプッシュ
+                if !current_text.is_empty() {
+                    spans.push(Span::styled(
+                        current_text.clone(),
+                        Style::default().fg(if in_tag { theme.comment } else { theme.fg }),
+                    ));
+                    current_text.clear();
+                }
+                in_tag = true;
+                current_text.push(c);
+            } else if c == '>' {
+                // タグ終了
+                current_text.push(c);
+                spans.push(Span::styled(
+                    current_text.clone(),
+                    Style::default().fg(theme.comment), // タグの色（コメント色と同じにして目立たなくする）
+                ));
+                current_text.clear();
+                in_tag = false;
+            } else {
+                current_text.push(c);
+            }
+        }
+        
+        // 行末に残ったテキストをプッシュ
+        if !current_text.is_empty() {
+             spans.push(Span::styled(
+                current_text,
+                Style::default().fg(if in_tag { theme.comment } else { theme.fg }),
+            ));
+        }
+
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
 }
 
 // --- メインロジック ---
@@ -216,8 +314,8 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 mode = AppMode::Explorer;
                             }
                             KeyCode::Up | KeyCode::Char('k') => state.scroll_up(),
-                            // 修正したscroll_downを呼ぶ
                             KeyCode::Down | KeyCode::Char('j') => state.scroll_down(),
+                            KeyCode::Char('y') => state.copy_to_clipboard(), // 'y'でコピー
                             _ => {}
                         }
                     }
@@ -229,7 +327,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 let command_text = explorer_state.command_input.trim().to_string();
                                 explorer_state.command_input.clear();
                                 explorer_state.in_command_mode = false;
-                                explorer_state.error_message = None; // コマンド実行時にエラーをクリア
+                                explorer_state.clear_message();
 
                                 let parts: Vec<&str> = command_text.split_whitespace().collect();
 
@@ -237,67 +335,31 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     ["q"] => {
                                         return Err(io::Error::new(io::ErrorKind::Other, "quit"));
                                     }
-                                    ["hp", filename] => {
-                                        let file_path = explorer_state.current_path.join(filename);
-                                        if !file_path.is_file() {
-                                            explorer_state.error_message = Some(format!("ファイルが見つかりません: {}", filename));
-                                            continue;
-                                        }
-
-                                        match fs::read_to_string(&file_path) {
-                                            Ok(markdown_input) => {
-                                                // MarkdownをHTMLに変換
-                                                let parser = MarkdownParser::new(&markdown_input);
-                                                let mut html_output = String::new();
-                                                html::push_html(&mut html_output, parser);
-
-                                                let char_count = html_output.chars().count();
-                                                let content = Text::from(html_output);
-                                                let title = format!("HTML Preview: {}", file_path.to_string_lossy());
-
-                                                preview_state = Some(PreviewState {
-                                                    content,
-                                                    scroll: 0,
-                                                    title,
-                                                    char_count,
-                                                });
-                                                mode = AppMode::Preview;
-                                            }
-                                            Err(e) => {
-                                                explorer_state.error_message = Some(format!("ファイル読み込みエラー: {}", e));
-                                            }
-                                        }
-                                    }
+                                    // :hp コマンドは削除されました
                                     ["cat", filename] => {
                                         let file_path = explorer_state.current_path.join(filename);
                                         if !file_path.is_file() {
-                                            explorer_state.error_message =
-                                                Some(format!("ファイルが見つかりません: {}", filename));
+                                            explorer_state.set_message(
+                                                format!("ファイルが見つかりません: {}", filename),
+                                                true,
+                                            );
                                             continue;
                                         }
 
                                         match fs::read_to_string(&file_path) {
                                             Ok(file_content) => {
-                                                let char_count = file_content.chars().count();
-                                                let content = Text::from(file_content);
-                                                let title = format!(
-                                                    "Cat: {}",
-                                                    file_path.to_string_lossy()
-                                                );
-
-                                                preview_state = Some(PreviewState {
-                                                    content,
-                                                    scroll: 0,
-                                                    title,
-                                                    char_count,
-                                                });
+                                                preview_state = Some(PreviewState::new_text(
+                                                    &file_path,
+                                                    file_content,
+                                                    theme,
+                                                ));
                                                 mode = AppMode::Preview;
                                             }
                                             Err(e) => {
-                                                explorer_state.error_message = Some(format!(
-                                                    "ファイル読み込みエラー: {}",
-                                                    e
-                                                ));
+                                                explorer_state.set_message(
+                                                    format!("ファイル読み込みエラー: {}", e),
+                                                    true,
+                                                );
                                             }
                                         }
                                     }
@@ -306,19 +368,38 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
 
                                         // ファイルの存在と拡張子をチェック
                                         if !file_path.is_file() {
-                                            explorer_state.error_message = Some(format!("ファイルが見つかりません: {}", filename));
-                                        } else if file_path.extension().and_then(|s| s.to_str()) != Some("html") {
-                                            explorer_state.error_message = Some("HTMLファイルのみ開けます。".to_string());
+                                            explorer_state.set_message(
+                                                format!("ファイルが見つかりません: {}", filename),
+                                                true,
+                                            );
+                                        } else if file_path.extension().and_then(|s| s.to_str())
+                                            != Some("html")
+                                        {
+                                            explorer_state.set_message(
+                                                "HTMLファイルのみ開けます。".to_string(),
+                                                true,
+                                            );
                                         } else {
                                             // ブラウザで開く
                                             if let Err(e) = opener::open(&file_path) {
-                                                explorer_state.error_message = Some(format!("ブラウザで開けませんでした: {}", e));
+                                                explorer_state.set_message(
+                                                    format!("ブラウザで開けませんでした: {}", e),
+                                                    true,
+                                                );
+                                            } else {
+                                                explorer_state.set_message(
+                                                    format!("ブラウザで開きました: {}", filename),
+                                                    false,
+                                                );
                                             }
                                         }
                                     }
                                     [] => {} // 空のコマンドは無視
                                     _ => {
-                                        explorer_state.error_message = Some(format!("不明なコマンドです: {}", command_text));
+                                        explorer_state.set_message(
+                                            format!("不明なコマンドです: {}", command_text),
+                                            true,
+                                        );
                                     }
                                 }
                             }
@@ -333,7 +414,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             _ => {}
                         }
                     } else {
-                        explorer_state.error_message = None; // 操作時にエラーをクリア
+                        explorer_state.clear_message(); // 操作時にメッセージをクリア
                         match key.code {
                             KeyCode::Char(':') => {
                                 explorer_state.in_command_mode = true;
@@ -346,26 +427,53 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     explorer_state.load_entries()?;
                                 }
                             }
-                             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                                 if let Some(selected_index) = explorer_state.list_state.selected() {
-                                    if let Some(selected_path) = explorer_state.entries.get(selected_index) {
+                                    if let Some(selected_path) =
+                                        explorer_state.entries.get(selected_index)
+                                    {
                                         let selected_path = selected_path.clone();
                                         if selected_path.is_dir() {
-                                            explorer_state.current_path = dunce::canonicalize(selected_path)?;
+                                            // ディレクトリなら移動
+                                            explorer_state.current_path =
+                                                dunce::canonicalize(selected_path)?;
                                             explorer_state.load_entries()?;
                                         } else {
-                                            if selected_path.extension().and_then(|s| s.to_str()) == Some("md") {
-                                                match PreviewState::new(&selected_path, theme) {
-                                                    Ok(state) => {
-                                                        preview_state = Some(state);
+                                            // ファイルの場合
+                                            if selected_path.extension().and_then(|s| s.to_str())
+                                                == Some("md")
+                                            {
+                                                // .mdファイルならHTMLに変換してプレビュー画面で表示する
+                                                match fs::read_to_string(&selected_path) {
+                                                    Ok(markdown_input) => {
+                                                        let parser = MarkdownParser::new_ext(
+                                                            &markdown_input,
+                                                            Options::all(),
+                                                        );
+                                                        let mut html_output = String::new();
+                                                        html::push_html(&mut html_output, parser);
+
+                                                        preview_state =
+                                                            Some(PreviewState::new_html(
+                                                                &selected_path,
+                                                                html_output,
+                                                                theme,
+                                                            ));
                                                         mode = AppMode::Preview;
                                                     }
                                                     Err(e) => {
-                                                        explorer_state.error_message = Some(format!("プレビューを開けません: {}", e));
+                                                        explorer_state.set_message(
+                                                            format!("ファイル読み込みエラー: {}", e),
+                                                            true,
+                                                        );
                                                     }
                                                 }
                                             } else {
-                                                explorer_state.error_message = Some("Markdownファイル以外はプレビューできません。".to_string());
+                                                explorer_state.set_message(
+                                                    "Markdownファイルを選択するとHTMLソースを表示します。"
+                                                        .to_string(),
+                                                    false,
+                                                );
                                             }
                                         }
                                     }
@@ -380,8 +488,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     }
 }
 
-
-// --- UI描画 ---
+// UI描画
 
 fn ui_explorer(f: &mut Frame, state: &mut ExplorerState, theme: &ColorScheme) {
     let chunks = Layout::default()
@@ -432,16 +539,21 @@ fn ui_explorer(f: &mut Frame, state: &mut ExplorerState, theme: &ColorScheme) {
     let status_bar_style = Style::default().fg(theme.fg).bg(theme.bg);
     let status_text = if state.in_command_mode {
         format!(":{}", state.command_input)
-    } else if let Some(err) = &state.error_message {
-        err.clone()
+    } else if let Some(msg) = &state.status_message {
+        msg.clone()
     } else {
-        "j/k or ↓/↑: Move | l/Enter: Open | h: Up | :<command> Enter: Run".to_string()
+        "j/k: Move | Enter: View HTML Source | :<cmd>: Command (:cat, :ob, :q)".to_string()
     };
-    let status_bar = Paragraph::new(status_text).style(if state.error_message.is_some() {
-        status_bar_style.fg(Color::Red)
+    
+    let status_color = if state.is_error {
+        Color::Red
+    } else if state.status_message.is_some() {
+        Color::Green // 成功メッセージなどは緑などにする
     } else {
-        status_bar_style
-    });
+        theme.fg
+    };
+
+    let status_bar = Paragraph::new(status_text).style(status_bar_style.fg(status_color));
 
     f.render_widget(status_bar, chunks[1]);
 }
@@ -451,7 +563,7 @@ fn ui_preview(f: &mut Frame, state: &mut PreviewState, theme: &ColorScheme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0), // Main content
+            Constraint::Min(0),    // Main content
             Constraint::Length(1), // Footer
         ])
         .split(f.size());
@@ -464,7 +576,11 @@ fn ui_preview(f: &mut Frame, state: &mut PreviewState, theme: &ColorScheme) {
     f.render_widget(paragraph, chunks[0]);
 
     // Footer
-    let footer_text = format!("{} | {} chars | Press 'q' to close", state.title, state.char_count);
+    let msg = state.status_message.as_deref().unwrap_or("Press 'q' to close | 'y' to copy");
+    let footer_text = format!(
+        "{} | {} chars | {}",
+        state.title, state.char_count, msg
+    );
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(theme.comment).bg(theme.bg))
         .alignment(Alignment::Right);
@@ -485,233 +601,4 @@ fn restore_terminal() -> Result<(), Box<dyn Error>> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
-}
-
-// --- Markdownレンダリング ---
-fn render_markdown(markdown_input: &str, br_placeholder: &str, theme: &ColorScheme) -> Text<'static> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut style_stack: Vec<Style> = vec![Style::default().fg(theme.fg)];
-    let mut list_stack: Vec<u64> = Vec::new();
-    let mut table_alignments: Vec<MarkdownAlignment> = Vec::new();
-    let mut in_table_header = false;
-    let mut in_code_block = false;
-
-    let parser = MarkdownParser::new_ext(markdown_input, Options::all());
-    for event in parser {
-        match event {
-            MarkdownEvent::Start(tag) => {
-                let current_style = *style_stack.last().unwrap_or(&Style::default());
-                match tag {
-                    Tag::Heading { level, .. } => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        lines.push(Line::default());
-                        let base_style = Style::default()
-                                .add_modifier(Modifier::BOLD)
-                                .fg(theme.heading);
-                        let style = if level >= HeadingLevel::H3 {
-                            base_style.add_modifier(Modifier::DIM)
-                        } else {
-                            base_style
-                        };
-                        style_stack.push(style);
-                    }
-                    Tag::BlockQuote => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        let style = Style::default().fg(theme.quote_fg);
-                        current_spans.push(Span::styled("▎".to_string(), Style::default().fg(theme.quote_border)));
-                        current_spans.push(Span::raw(" ".to_string()));
-                        style_stack.push(style);
-                    }
-                    Tag::CodeBlock(kind) => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        lines.push(Line::default());
-                        in_code_block = true;
-                        let lang = match kind {
-                            CodeBlockKind::Fenced(lang) => lang.into_string(),
-                            CodeBlockKind::Indented => String::new(),
-                        };
-                        let border_style = Style::default().fg(theme.comment);
-                        lines.push(Line::from(vec![
-                            Span::styled("┌─── ".to_string(), border_style),
-                            Span::styled(lang, Style::default().fg(Color::Yellow)),
-                        ]));
-                        style_stack.push(Style::default().bg(theme.code_bg));
-                    }
-                    Tag::Table(aligns) => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        table_alignments = aligns;
-                    }
-                    Tag::TableHead => {
-                        in_table_header = true;
-                    }
-                    Tag::TableRow => {
-                        current_spans
-                            .push(Span::styled("│ ".to_string(), Style::default().fg(theme.comment)));
-                    }
-                    Tag::TableCell => { /* No action needed */ }
-                    Tag::List(start_num) => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        list_stack.push(start_num.unwrap_or(1));
-                    }
-                    Tag::Item => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        let indent = "  ".repeat(list_stack.len().saturating_sub(1));
-                        let marker = if let Some(num) = list_stack.last_mut() {
-                            let m = format!("{}. ", *num);
-                            *num += 1;
-                            m
-                        } else {
-                            "• ".to_string()
-                        };
-                        current_spans.push(Span::raw(indent));
-                        current_spans
-                            .push(Span::styled(marker, Style::default().fg(theme.comment)));
-                    }
-                    Tag::Emphasis => {
-                        style_stack.push(current_style.add_modifier(Modifier::ITALIC));
-                    }
-                    Tag::Strong => {
-                        style_stack.push(current_style.add_modifier(Modifier::BOLD));
-                    }
-                    Tag::Strikethrough => {
-                        style_stack.push(current_style.add_modifier(Modifier::CROSSED_OUT));
-                    }
-                    Tag::Link { .. } => {
-                        style_stack
-                        .push(Style::default().fg(theme.link).add_modifier(Modifier::UNDERLINED));
-                    }
-                    _ => {}
-                }
-            }
-            MarkdownEvent::End(tag) => {
-                match tag {
-                    TagEnd::Heading(_) | TagEnd::BlockQuote | TagEnd::Item => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        style_stack.pop();
-                    }
-                    TagEnd::CodeBlock => {
-                        in_code_block = false;
-                        lines.push(Line::from(Span::styled(
-                            "└──────────────────".to_string(),
-                            Style::default().fg(theme.comment),
-                        )));
-                        lines.push(Line::default());
-                        style_stack.pop();
-                    }
-                    TagEnd::Table => {
-                        table_alignments.clear();
-                        lines.push(Line::default());
-                    }
-                    TagEnd::TableHead => {
-                        in_table_header = false;
-                    }
-                    TagEnd::TableRow => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                    }
-                    TagEnd::TableCell => {
-                        current_spans.push(Span::styled(" │ ".to_string(), Style::default().fg(theme.comment)));
-                    }
-                    TagEnd::List(_) => {
-                        list_stack.pop();
-                        lines.push(Line::default());
-                    }
-                    TagEnd::Paragraph => {
-                        if !current_spans.is_empty() {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        lines.push(Line::default());
-                    }
-                    TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
-                        style_stack.pop();
-                    }
-                    _ => {}
-                }
-            }
-            MarkdownEvent::Text(text) => {
-                let style = *style_stack.last().unwrap_or(&Style::default());
-                if in_code_block {
-                    for line in text.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ".to_string(), Style::default().fg(theme.comment)),
-                            Span::styled(line.to_string(), style.fg(theme.fg)),
-                        ]));
-                    }
-                } else {
-                    let final_style = if in_table_header {
-                        style.add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    };
-
-                    if !br_placeholder.is_empty() && text.contains(br_placeholder) {
-                        let mut last_pos = 0;
-                        while let Some(placeholder_pos) = text[last_pos..].find(br_placeholder) {
-                            let absolute_pos = last_pos + placeholder_pos;
-                            let before = &text[last_pos..absolute_pos];
-                            if !before.is_empty() {
-                                current_spans.push(Span::styled(before.to_string(), final_style));
-                            }
-                            if !current_spans.is_empty() {
-                                lines.push(Line::from(std::mem::take(&mut current_spans)));
-                            }
-                            last_pos = absolute_pos + br_placeholder.len();
-                        }
-                        let remaining = &text[last_pos..];
-                        if !remaining.is_empty() {
-                            current_spans.push(Span::styled(remaining.to_string(), final_style));
-                        }
-                    } else {
-                        current_spans.push(Span::styled(text.to_string(), final_style));
-                    }
-                }
-            }
-            MarkdownEvent::Html(html) => {
-                current_spans.push(Span::styled(html.to_string(), Style::default().fg(theme.comment)));
-            }
-            MarkdownEvent::Code(text) => {
-                let style = Style::default().fg(theme.fg).bg(theme.inline_code_bg);
-                current_spans.push(Span::styled(format!(" {} ", text), style));
-            }
-            MarkdownEvent::HardBreak => {
-                if !current_spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-            }
-            MarkdownEvent::SoftBreak => {
-                current_spans.push(Span::raw(" ".to_string()));
-            }
-            MarkdownEvent::Rule => {
-                if !current_spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(80),
-                    Style::default().fg(theme.hr),
-                )));
-                lines.push(Line::default());
-            }
-            _ => {}
-        }
-    }
-    if !current_spans.is_empty() {
-        lines.push(Line::from(std::mem::take(&mut current_spans)));
-    }
-    Text::from(lines)
 }
