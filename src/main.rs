@@ -469,11 +469,23 @@ fn run<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                                     }
                                                 }
                                             } else {
-                                                explorer_state.set_message(
-                                                    "Markdownファイルを選択するとHTMLソースを表示します。"
-                                                        .to_string(),
-                                                    false,
-                                                );
+                                                // .md以外のファイルはプレーンテキストとして開く
+                                                match fs::read_to_string(&selected_path) {
+                                                    Ok(file_content) => {
+                                                        preview_state = Some(PreviewState::new_text(
+                                                            &selected_path,
+                                                            file_content,
+                                                            theme,
+                                                        ));
+                                                        mode = AppMode::Preview;
+                                                    }
+                                                    Err(e) => {
+                                                        explorer_state.set_message(
+                                                            format!("ファイル読み込みエラー: {}", e),
+                                                            true,
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
