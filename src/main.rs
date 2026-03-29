@@ -266,6 +266,22 @@ fn highlight_html(html_source: &str, theme: &ColorScheme) -> Text<'static> {
 // --- メインロジック ---
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    
+    // -m フラグのチェック
+    if let Some(pos) = args.iter().position(|arg| arg == "-m") {
+        if let Some(filename) = args.get(pos + 1) {
+            if let Err(e) = run_cui_mode(filename) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        } else {
+            eprintln!("使用法: peek -m <ファイル名>");
+            std::process::exit(1);
+        }
+    }
+
     // TUIモードの起動
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal);
@@ -277,6 +293,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("エラーが発生しました: {}", err);
         }
     }
+    Ok(())
+}
+
+fn run_cui_mode(filename: &str) -> Result<(), Box<dyn Error>> {
+    let path = Path::new(filename);
+
+    // 拡張子チェック
+    if path.extension().and_then(|s| s.to_str()) != Some("md") {
+        return Err("エラー: マークダウンファイル（.md）ではありません。".into());
+    }
+
+    // ファイル読み込み
+    let markdown_input = fs::read_to_string(path)?;
+
+    // HTML変換
+    let parser = MarkdownParser::new_ext(&markdown_input, Options::all());
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+
+    // クリップボードに登録
+    let mut clipboard = Clipboard::new()?;
+    clipboard.set_text(&html_output)?;
+
+    println!("HTMLへの変換とクリップボードへの登録が完了しました。");
+    println!("{}", html_output);
+
     Ok(())
 }
 
